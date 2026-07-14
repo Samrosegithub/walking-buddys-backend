@@ -29,6 +29,21 @@ function adminAuth(req, res, next) {
   next();
 }
 
+// ── Twilio SMS helper ─────────────────────────────────────────────────────────
+async function sendSMS(to, body) {
+  const sid  = process.env.TWILIO_SID;
+  const auth = process.env.TWILIO_AUTH;
+  const from = process.env.TWILIO_FROM;
+  if (!sid || !auth || !from) return;
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
+  const params = new URLSearchParams({ To: to, From: from, Body: body });
+  await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: 'Basic ' + Buffer.from(`${sid}:${auth}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params,
+  });
+}
+
 // ── Admin routes ──────────────────────────────────────────────────────────────
 
 app.get('/admin/stats', adminAuth, async (_req, res) => {
@@ -74,6 +89,129 @@ app.get('/admin/walks', adminAuth, async (_req, res) => {
       LIMIT 100
     `);
     res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Acuity Webhook ────────────────────────────────────────────────────────────
+// Register this URL in Acuity: Integrations → Webhooks → https://walking-buddys-backend.onrender.com/webhooks/acuity
+app.post('/webhooks/acuity', async (req, res) => {
+  try {
+    const { action, id: acuityId, firstName, lastName, email, phone, datetime, duration, price, appointmentTypeID } = req.body;
+    if (!email || !acuityId) return res.json({ ok: true });
+
+    // Upsert customer
+    const cResult = await pool.query(
+      `INSERT INTO customers (first_name, last_name, email, phone)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (email) DO UPDATE SET first_name=$1, last_name=$2, phone=COALESCE($4, customers.phone)
+       RETURNING id`,
+      [firstName || '', lastName || '', email, phone || null]
+    );
+    const customerId = cResult.rows[0].id;
+
+    if (action === 'scheduled' || action === 'rescheduled') {
+      const dt = datetime ? new Date(datetime) : null;
+      const dateStr = dt ? dt.toISOString().split('T')[0] : null;
+      const timeStr = dt ? dt.toTimeString().slice(0,5) : null;
+      const durationStr = duration ? `${duration} min` : null;
+      await pool.query(
+        `INSERT INTO walks (customer_id, acuity_id, date, time, duration, price, status, source)
+         VALUES ($1,$2,$3,$4,$5,$6,'upcoming','acuity')
+         ON CONFLICT (acuity_id) DO UPDATE SET date=$3, time=$4, duration=$5, price=$6, status='upcoming'`,
+        [customerId, String(acuityId), dateStr, timeStr, durationStr, price || 0]
+      );
+    } else if (action === 'cancelled') {
+      await pool.query(`UPDATE walks SET status='cancelled' WHERE acuity_id=$1`, [String(acuityId)]);
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Webhook error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Notification cron (ping this every 5 min from cron-job.org) ───────────────
+// GET https://walking-buddys-backend.onrender.com/cron/notify?key=wb-admin-2024
+app.get('/cron/notify', async (req, res) => {
+  if (req.query.key !== process.env.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const notifyPhone = process.env.NOTIFY_PHONE; // your cell, e.g. +18479222361
+  if (!notifyPhone) return res.json({ skipped: 'no NOTIFY_PHONE set' });
+
+  try {
+    const now = new Date();
+    // Find upcoming walks whose datetime falls in the next 55-65 min (1hr window) or 10-20 min (15min window)
+    const result = await pool.query(`
+      SELECT w.*, c.first_name, c.last_name, d.name as dog_name
+      FROM walks w
+      JOIN customers c ON c.id = w.customer_id
+      LEFT JOIN dogs d ON d.customer_id = c.id
+      WHERE w.status = 'upcoming' AND w.date IS NOT NULL AND w.time IS NOT NULL
+    `);
+
+    const sent = [];
+    for (const walk of result.rows) {
+      const walkDT = new Date(`${walk.date}T${walk.time}:00`);
+      const diffMin = (walkDT - now) / 60000;
+
+      if (diffMin >= 55 && diffMin <= 65) {
+        const msg = `🐾 Walk in 1 HOUR — ${walk.first_name} ${walk.last_name}${walk.dog_name ? ` (${walk.dog_name})` : ''} at ${walk.time}`;
+        await sendSMS(notifyPhone, msg);
+        sent.push({ walk: walk.id, type: '1hr' });
+      } else if (diffMin >= 10 && diffMin <= 20) {
+        const msg = `🐾 Walk in 15 MIN — ${walk.first_name} ${walk.last_name}${walk.dog_name ? ` (${walk.dog_name})` : ''} at ${walk.time}`;
+        await sendSMS(notifyPhone, msg);
+        sent.push({ walk: walk.id, type: '15min' });
+      }
+    }
+
+    res.json({ ok: true, checked: result.rows.length, sent });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Admin: manual walk entry + subscription toggle ────────────────────────────
+app.post('/admin/walks', adminAuth, async (req, res) => {
+  try {
+    const { customer_id, date, time, duration, price, notes, status } = req.body;
+    const result = await pool.query(
+      `INSERT INTO walks (customer_id, date, time, duration, price, notes, status, source)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'manual') RETURNING *`,
+      [customer_id, date, time || null, duration || null, price || 0, notes || null, status || 'upcoming']
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/admin/walks/:id', adminAuth, async (req, res) => {
+  try {
+    const { status, date, time, duration, price, notes } = req.body;
+    const result = await pool.query(
+      `UPDATE walks SET
+        status=COALESCE($1,status), date=COALESCE($2,date), time=COALESCE($3,time),
+        duration=COALESCE($4,duration), price=COALESCE($5,price), notes=COALESCE($6,notes)
+       WHERE id=$7 RETURNING *`,
+      [status, date, time, duration, price, notes, req.params.id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/admin/customers/:id/subscription', adminAuth, async (req, res) => {
+  try {
+    const { active } = req.body;
+    const result = await pool.query(
+      `UPDATE customers SET subscription_active=$1 WHERE id=$2 RETURNING *`,
+      [active, req.params.id]
+    );
+    res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
