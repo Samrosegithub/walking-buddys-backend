@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const cron = require('node-cron');
 const { pool, init } = require('./db');
 
 const app = express();
@@ -387,12 +388,55 @@ app.get('/acuity/appointment-types', async (_req, res) => {
   }
 });
 
+// ── Internal cron: check every 5 min for upcoming walks ───────────────────────
+async function runNotifyCheck() {
+  if (!process.env.NOTIFY_EMAIL) return;
+  try {
+    const now = new Date();
+    const result = await pool.query(`
+      SELECT w.*, c.first_name, c.last_name, d.name as dog_name
+      FROM walks w
+      JOIN customers c ON c.id = w.customer_id
+      LEFT JOIN dogs d ON d.customer_id = c.id
+      WHERE w.status = 'upcoming' AND w.date IS NOT NULL AND w.time IS NOT NULL
+    `);
+    for (const walk of result.rows) {
+      const walkDT = new Date(`${walk.date.toISOString().split('T')[0]}T${walk.time}:00`);
+      const diffMin = (walkDT - now) / 60000;
+      const detail = `${walk.first_name} ${walk.last_name}${walk.dog_name ? ` (${walk.dog_name})` : ''} at ${walk.time}`;
+      if (diffMin >= 55 && diffMin <= 65) {
+        await sendEmail(
+          `🐾 Walk in 1 HOUR — ${detail}`,
+          `Upcoming walk in about 1 hour:\n\nCustomer: ${walk.first_name} ${walk.last_name}\nDog: ${walk.dog_name || '—'}\nTime: ${walk.time}\nDuration: ${walk.duration || '—'}\nPrice: $${walk.price || 0}`
+        );
+        console.log(`1hr notice sent for walk ${walk.id}`);
+      } else if (diffMin >= 10 && diffMin <= 20) {
+        await sendEmail(
+          `🐾 Walk in 15 MIN — ${detail}`,
+          `Walk starting soon:\n\nCustomer: ${walk.first_name} ${walk.last_name}\nDog: ${walk.dog_name || '—'}\nTime: ${walk.time}\nDuration: ${walk.duration || '—'}\nPrice: $${walk.price || 0}`
+        );
+        console.log(`15min notice sent for walk ${walk.id}`);
+      }
+    }
+  } catch (err) {
+    console.error('Cron notify error:', err.message);
+  }
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 8248;
 init().then(() => {
-  app.listen(PORT, () => console.log(`Walking Buddy's backend running on port ${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`Walking Buddy's backend running on port ${PORT}`);
+    // Run every 5 minutes
+    cron.schedule('*/5 * * * *', runNotifyCheck);
+    console.log('Walk notification cron started (every 5 min)');
+  });
 }).catch(err => {
   console.error('DB init failed:', err.message);
-  app.listen(PORT, () => console.log(`Running without DB on port ${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`Running without DB on port ${PORT}`);
+    cron.schedule('*/5 * * * *', runNotifyCheck);
+  });
 });
