@@ -22,6 +22,63 @@ const acuityAuth = 'Basic ' + Buffer.from(`${ACUITY_USER}:${ACUITY_KEY}`).toStri
 // Health check
 app.get('/', (_req, res) => res.json({ ok: true, service: "Walking Buddy's API" }));
 
+// ── Admin auth middleware ──────────────────────────────────────────────────────
+function adminAuth(req, res, next) {
+  const key = req.headers['x-admin-key'];
+  if (!key || key !== process.env.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+// ── Admin routes ──────────────────────────────────────────────────────────────
+
+app.get('/admin/stats', adminAuth, async (_req, res) => {
+  try {
+    const [customers, walks, revenue] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM customers'),
+      pool.query('SELECT COUNT(*) FROM walks'),
+      pool.query('SELECT COALESCE(SUM(price),0) as total FROM walks WHERE status=$1', ['completed']),
+    ]);
+    res.json({
+      total_customers: parseInt(customers.rows[0].count),
+      total_walks: parseInt(walks.rows[0].count),
+      total_revenue: parseFloat(revenue.rows[0].total),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/customers', adminAuth, async (_req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT c.*,
+        (SELECT row_to_json(d) FROM dogs d WHERE d.customer_id = c.id LIMIT 1) as dog,
+        (SELECT COUNT(*) FROM walks w WHERE w.customer_id = c.id) as walk_count,
+        (SELECT COALESCE(SUM(price),0) FROM walks w WHERE w.customer_id = c.id AND w.status='completed') as total_spent
+      FROM customers c
+      ORDER BY c.created_at DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/admin/walks', adminAuth, async (_req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT w.*, c.first_name, c.last_name, c.email
+      FROM walks w
+      JOIN customers c ON c.id = w.customer_id
+      ORDER BY w.date DESC
+      LIMIT 100
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Customers ─────────────────────────────────────────────────────────────────
 
 app.post('/customers', async (req, res) => {
