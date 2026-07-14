@@ -29,19 +29,19 @@ function adminAuth(req, res, next) {
   next();
 }
 
-// ── Twilio SMS helper ─────────────────────────────────────────────────────────
-async function sendSMS(to, body) {
-  const sid  = process.env.TWILIO_SID;
-  const auth = process.env.TWILIO_AUTH;
-  const from = process.env.TWILIO_FROM;
-  if (!sid || !auth || !from) return;
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
-  const params = new URLSearchParams({ To: to, From: from, Body: body });
-  await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: 'Basic ' + Buffer.from(`${sid}:${auth}`).toString('base64'), 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params,
+// ── Email notification helper ─────────────────────────────────────────────────
+const nodemailer = require('nodemailer');
+
+async function sendEmail(subject, text) {
+  const user = process.env.NOTIFY_EMAIL;       // your Gmail address
+  const pass = process.env.NOTIFY_EMAIL_PASS;  // Gmail app password
+  const to   = process.env.NOTIFY_TO || user;
+  if (!user || !pass) return;
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user, pass },
   });
+  await transporter.sendMail({ from: user, to, subject, text });
 }
 
 // ── Admin routes ──────────────────────────────────────────────────────────────
@@ -137,8 +137,7 @@ app.post('/webhooks/acuity', async (req, res) => {
 // GET https://walking-buddys-backend.onrender.com/cron/notify?key=wb-admin-2024
 app.get('/cron/notify', async (req, res) => {
   if (req.query.key !== process.env.ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  const notifyPhone = process.env.NOTIFY_PHONE; // your cell, e.g. +18479222361
-  if (!notifyPhone) return res.json({ skipped: 'no NOTIFY_PHONE set' });
+  if (!process.env.NOTIFY_EMAIL) return res.json({ skipped: 'no NOTIFY_EMAIL set' });
 
   try {
     const now = new Date();
@@ -157,12 +156,12 @@ app.get('/cron/notify', async (req, res) => {
       const diffMin = (walkDT - now) / 60000;
 
       if (diffMin >= 55 && diffMin <= 65) {
-        const msg = `🐾 Walk in 1 HOUR — ${walk.first_name} ${walk.last_name}${walk.dog_name ? ` (${walk.dog_name})` : ''} at ${walk.time}`;
-        await sendSMS(notifyPhone, msg);
+        const detail = `${walk.first_name} ${walk.last_name}${walk.dog_name ? ` (${walk.dog_name})` : ''} at ${walk.time}`;
+        await sendEmail(`🐾 Walk in 1 HOUR — ${detail}`, `Upcoming walk in about 1 hour:\n\nCustomer: ${walk.first_name} ${walk.last_name}\nDog: ${walk.dog_name || '—'}\nTime: ${walk.time}\nDuration: ${walk.duration || '—'}\nPrice: $${walk.price || 0}`);
         sent.push({ walk: walk.id, type: '1hr' });
       } else if (diffMin >= 10 && diffMin <= 20) {
-        const msg = `🐾 Walk in 15 MIN — ${walk.first_name} ${walk.last_name}${walk.dog_name ? ` (${walk.dog_name})` : ''} at ${walk.time}`;
-        await sendSMS(notifyPhone, msg);
+        const detail = `${walk.first_name} ${walk.last_name}${walk.dog_name ? ` (${walk.dog_name})` : ''} at ${walk.time}`;
+        await sendEmail(`🐾 Walk in 15 MIN — ${detail}`, `Walk starting soon:\n\nCustomer: ${walk.first_name} ${walk.last_name}\nDog: ${walk.dog_name || '—'}\nTime: ${walk.time}\nDuration: ${walk.duration || '—'}\nPrice: $${walk.price || 0}`);
         sent.push({ walk: walk.id, type: '15min' });
       }
     }
